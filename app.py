@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # App: Programação de Produção 2º Sem/2026 (balanceamento diário por MODELO)
 # Autor: M365 Copilot p/ Jeferson Santana
-# Como rodar:
+# Como rodar local:
 #   pip install -r requirements.txt
 #   streamlit run app.py
 
 import io
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from calendar import monthrange
 from dateutil.relativedelta import relativedelta
 
@@ -44,7 +44,7 @@ Pode haver linhas repetidas (PRODUTO/MERCADO/MODELO): serão **somadas**.
     """)
 
 st.sidebar.header("⚙️ Parâmetros")
-uploaded = st.sidebar.file_uploader("Carregar arquivo Excel (base)", type=["xlsx"]) 
+uploaded = st.sidebar.file_uploader("Carregar arquivo Excel (base)", type=["xlsx"])
 
 # Parâmetros variáveis ([PARAM])
 limite_diario_por_modelo = st.sidebar.number_input(
@@ -79,12 +79,6 @@ PT_BR_MONTHS = {
     1:"jan", 2:"fev", 3:"mar", 4:"abr", 5:"mai", 6:"jun",
     7:"jul", 8:"ago", 9:"set", 10:"out", 11:"nov", 12:"dez"
 }
-
-def first_business_day(year: int, month: int) -> date:
-    d = date(year, month, 1)
-    while d.weekday() >= 5:  # 5=Sat,6=Sun
-        d += timedelta(days=1)
-    return d
 
 def business_days_in_month(year: int, month: int):
     last_day = monthrange(year, month)[1]
@@ -272,7 +266,8 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
             excedente -= cap_sab
         if excedente > 0:
             raise ValueError(
-                f"Excedente mensal de {excedente} não cabe nos sábados de {month:02d}/{year}. Aumente 'teto_sabado' ou revise a demanda.")
+                f"Excedente mensal de {excedente} não cabe nos sábados de {month:02d}/{year}. Aumente 'teto_sabado' ou revise a demanda."
+            )
 
     def allocate_day(day_date: date, S: int, results: list):
         # Monta saldos por MODELO
@@ -340,8 +335,7 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
     results_month = []
 
     if necessario_inicial <= capacidade_dias_uteis:
-        remaining_before = necessario_inicial
-        for i, d in enumerate(used_weekdays):
+        for d in used_weekdays:
             rem = total_necessario()
             if rem <= 0:
                 break
@@ -420,9 +414,20 @@ def finalize_output(all_rows, relatorios):
     prog = pd.DataFrame(all_rows)
     if prog.empty:
         prog = pd.DataFrame(columns=["date","PRODUTO","MODELO","MERCADO"])
+
+    # 🔧 CONVERSÃO CRÍTICA: garante que 'date' é datetime64[ns] para usar .dt
+    if "date" in prog.columns:
+        prog["date"] = pd.to_datetime(prog["date"])  # <- evita o erro do .dt
+
     prog = prog.sort_values(by=["date","MODELO","PRODUTO"], kind="stable").reset_index(drop=True)
+
+    # IDs globais sequenciais (fila 1...N)
     prog["ID"] = ["fila " + str(i) for i in range(1, len(prog)+1)]
-    prog["mes_ano"] = prog["date"].apply(lambda d: month_label_pt_br(d))
+
+    # Mês/ano (rótulo pt-BR) – aceita Timestamp ou date
+    prog["mes_ano"] = prog["date"].apply(
+        lambda d: month_label_pt_br(d.date() if hasattr(d, "date") else d)
+    )
     prog["mes"] = prog["date"].dt.month
     prog["ano"] = prog["date"].dt.year
 
