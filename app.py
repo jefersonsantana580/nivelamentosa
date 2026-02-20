@@ -6,7 +6,7 @@
 #   streamlit run app.py
 
 import io
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from calendar import monthrange
 from dateutil.relativedelta import relativedelta
 
@@ -29,11 +29,11 @@ with st.expander("📎 Instruções (resumo)", expanded=False):
 Pode haver linhas repetidas (PRODUTO/MERCADO/MODELO): serão **somadas**.
 
 **Regras** (principais):
-- Seg–Sex, sem feriados, **50 unid/dia útil**.
+- Seg–Sex, sem feriados (feriados opcionais via lista), **capacidade por dia útil = `capacidade_dia_util`** (padrão 50).
 - Começa no **1º dia útil de jul/2026**.
 - Prioridade diária: mercados **≠ "MERCADO INTERNO"** antes de MI.
 - Cumpre **exatamente** o volume mensal por **PRODUTO**.
-- Excedente do mês vai para **sábados do mesmo mês** (máx. por sábado = `teto_sabado`).
+- Excedente do mês vai para **sábados do mesmo mês** (máx. por sábado = `teto_sabado`), ignorando **sábados que forem feriado**.
 - Balanceamento diário por **MODELO** via **cotas proporcionais e maiores restos** + **round-robin**.
 - IDs globais únicos: `fila 1 ... fila N` (ordenados por data, MODELO, PRODUTO).
 
@@ -51,8 +51,12 @@ limite_diario_por_modelo = st.sidebar.number_input(
     "limite_diario_por_modelo (opcional)", min_value=0, step=1, value=0,
     help="0 = desativado. Se >0, nenhum MODELO ultrapassa esse número por dia."
 )
+capacidade_dia_util = st.sidebar.number_input(
+    "capacidade_dia_util (todas os MODELOS juntos)", min_value=1, step=1, value=50,
+    help="Capacidade total por dia útil (padrão 50)."
+)
 teto_sabado = st.sidebar.number_input(
-    "teto_sabado", min_value=1, max_value=50, value=50,
+    "teto_sabado", min_value=1, max_value=1000, value=50,
     help="Capacidade máxima por sábado usado para excedente mensal."
 )
 nomenclatura_arquivo = st.sidebar.text_input(
@@ -69,6 +73,56 @@ intervalo = st.sidebar.date_input(
     help="Use para trocar o semestre, mantendo regras. Considera meses completos entre as duas datas."
 )
 
+# =========================
+# Feriados (novidade)
+# =========================
+st.sidebar.subheader("📅 Feriados (opcional)")
+feriados_text = st.sidebar.text_area(
+    "Lista de feriados (um por linha)",
+    value="",
+    placeholder="Exemplos válidos:\n2026-09-07\n07/09/2026\n2026-12-25",
+    help="Datas no formato YYYY-MM-DD ou DD/MM/YYYY; um por linha."
+)
+feriados_csv = st.sidebar.file_uploader(
+    "ou envie CSV com coluna 'data'",
+    type=["csv"],
+    help="CSV com cabeçalho 'data' contendo as datas de feriado."
+)
+
+def parse_feriados(text: str, csv_file) -> set:
+    datas = set()
+    # Text area
+    for raw in (text or '').replace(";", "\n").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        dt = None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+            try:
+                dt = datetime.strptime(s, fmt).date()
+                break
+            except Exception:
+                continue
+        if dt:
+            datas.add(dt)
+    # CSV
+    if csv_file is not None:
+        try:
+            d = pd.read_csv(csv_file)
+            if 'data' in d.columns:
+                for x in d['data'].tolist():
+                    try:
+                        dt = pd.to_datetime(x, dayfirst=True).date()
+                        datas.add(dt)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return datas
+
+feriados_set = parse_feriados(feriados_text, feriados_csv)
+st.sidebar.caption(f"Feriados carregados: {len(feriados_set)}")
+
 # Botão principal
 gerar = st.sidebar.button("🚀 Gerar Programação", type="primary", use_container_width=True)
 
@@ -80,21 +134,21 @@ PT_BR_MONTHS = {
     7:"jul", 8:"ago", 9:"set", 10:"out", 11:"nov", 12:"dez"
 }
 
-def business_days_in_month(year: int, month: int):
+def business_days_in_month(year: int, month: int, feriados: set):
     last_day = monthrange(year, month)[1]
     days = []
     for day in range(1, last_day + 1):
         d = date(year, month, day)
-        if d.weekday() < 5:  # Mon-Fri
+        if d.weekday() < 5 and d not in feriados:  # Mon-Fri e não feriado
             days.append(d)
     return days
 
-def saturdays_in_month(year: int, month: int):
+def saturdays_in_month(year: int, month: int, feriados: set):
     last_day = monthrange(year, month)[1]
     days = []
     for day in range(1, last_day + 1):
         d = date(year, month, day)
-        if d.weekday() == 5:  # Saturday
+        if d.weekday() == 5 and d not in feriados:  # Saturday e não feriado
             days.append(d)
     return days
 
@@ -221,17 +275,20 @@ def proportional_quotas(balance_by_model: dict, S: int, limit_per_model: int|Non
 
 
 def schedule_month(month_df: pd.DataFrame, year:int, month:int,
-                   limite_diario_por_modelo:int|None, teto_sabado:int):
+                   limite_diario_por_modelo:int|None, teto_sabado:int,
+                   capacidade_dia_util:int,
+                   feriados:set):
     """
     Gera a lista de produções do mês respeitando:
-    - Capacidade 50/dia útil, excedente em sábados (até teto_sabado)
+    - Capacidade 'capacidade_dia_util' por dia útil; excedente em sábados (até 'teto_sabado')
     - Uso de somente dias necessários quando necessário <= capacidade
     - Balanceamento por MODELO com cotas proporcionais + maiores restos
     - Prioridade de mercados != MERCADO INTERNO antes de MI
     - Cumprimento exato do volume por PRODUTO no mês
+    - Ignora feriados (seg-sex e sábados que estiverem na lista)
     Retorna lista de dicts: [{date, produto, modelo, mercado}, ...]
     """
-    WEEKDAY_CAP = 50
+    WEEKDAY_CAP = capacidade_dia_util
 
     # Saldos por (PRODUTO, MERCADO, MODELO)
     saldo_prod = {}
@@ -245,7 +302,7 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
     necessario_inicial = total_necessario()
 
     # Calendário do mês
-    bdays = business_days_in_month(year, month)
+    bdays = business_days_in_month(year, month, feriados)
     capacidade_dias_uteis = len(bdays) * WEEKDAY_CAP
 
     used_weekdays = []
@@ -257,7 +314,7 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
     else:
         used_weekdays = bdays
         excedente = necessario_inicial - capacidade_dias_uteis
-        sats = saturdays_in_month(year, month)
+        sats = saturdays_in_month(year, month, feriados)
         for s in sats:
             if excedente <= 0:
                 break
@@ -266,8 +323,7 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
             excedente -= cap_sab
         if excedente > 0:
             raise ValueError(
-                f"Excedente mensal de {excedente} não cabe nos sábados de {month:02d}/{year}. Aumente 'teto_sabado' ou revise a demanda."
-            )
+                f"Excedente mensal de {excedente} não cabe nos sábados (não feriados) de {month:02d}/{year}. Aumente 'teto_sabado', 'capacidade_dia_util' ou revise a demanda.")
 
     def allocate_day(day_date: date, S: int, results: list):
         # Monta saldos por MODELO
@@ -339,13 +395,13 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
             rem = total_necessario()
             if rem <= 0:
                 break
-            cap = min(50, rem)
+            cap = min(WEEKDAY_CAP, rem)
             allocate_day(d, cap, results_month)
     else:
         for d in used_weekdays:
             if total_necessario() <= 0:
                 break
-            allocate_day(d, 50, results_month)
+            allocate_day(d, WEEKDAY_CAP, results_month)
         for s, cap_sab in saturday_plan:
             if total_necessario() <= 0:
                 break
@@ -359,7 +415,7 @@ def schedule_month(month_df: pd.DataFrame, year:int, month:int,
 # =========================
 # Pipeline completo
 # =========================
-def build_schedule(df_agg: pd.DataFrame, months, limite_diario_por_modelo:int|None, teto_sabado:int):
+def build_schedule(df_agg: pd.DataFrame, months, limite_diario_por_modelo:int|None, teto_sabado:int, capacidade_dia_util:int, feriados:set):
     all_rows = []
     relatorios = []
     for (y, m) in months:
@@ -371,9 +427,9 @@ def build_schedule(df_agg: pd.DataFrame, months, limite_diario_por_modelo:int|No
         month_df["qty"] = pd.to_numeric(month_df["qty"], errors="coerce").fillna(0).astype(int)
         necessario = int(month_df["qty"].sum())
 
-        bdays = business_days_in_month(y, m)
+        bdays = business_days_in_month(y, m, feriados)
         dias_uteis = len(bdays)
-        capacidade = dias_uteis * 50
+        capacidade = dias_uteis * capacidade_dia_util
 
         if necessario == 0:
             relatorios.append({
@@ -390,7 +446,9 @@ def build_schedule(df_agg: pd.DataFrame, months, limite_diario_por_modelo:int|No
 
         month_plan = schedule_month(month_df, y, m,
                                     limite_diario_por_modelo=limite_diario_por_modelo,
-                                    teto_sabado=teto_sabado)
+                                    teto_sabado=teto_sabado,
+                                    capacidade_dia_util=capacidade_dia_util,
+                                    feriados=feriados)
         dfm = pd.DataFrame(month_plan)
         dfm["is_sat"] = dfm["date"].apply(lambda d: 1 if d.weekday()==5 else 0)
         programado_total = len(dfm)
@@ -415,19 +473,17 @@ def finalize_output(all_rows, relatorios):
     if prog.empty:
         prog = pd.DataFrame(columns=["date","PRODUTO","MODELO","MERCADO"])
 
-    # 🔧 CONVERSÃO CRÍTICA: garante que 'date' é datetime64[ns] para usar .dt
+    # Conversão para datetime64[ns]
     if "date" in prog.columns:
-        prog["date"] = pd.to_datetime(prog["date"])  # <- evita o erro do .dt
+        prog["date"] = pd.to_datetime(prog["date"])
 
     prog = prog.sort_values(by=["date","MODELO","PRODUTO"], kind="stable").reset_index(drop=True)
 
     # IDs globais sequenciais (fila 1...N)
     prog["ID"] = ["fila " + str(i) for i in range(1, len(prog)+1)]
 
-    # Mês/ano (rótulo pt-BR) – aceita Timestamp ou date
-    prog["mes_ano"] = prog["date"].apply(
-        lambda d: month_label_pt_br(d.date() if hasattr(d, "date") else d)
-    )
+    # Mês/ano (rótulo pt-BR)
+    prog["mes_ano"] = prog["date"].apply(lambda d: month_label_pt_br(d.date() if hasattr(d, "date") else d))
     prog["mes"] = prog["date"].dt.month
     prog["ano"] = prog["date"].dt.year
 
@@ -463,8 +519,27 @@ if gerar:
         colmap = map_month_columns(df_src, months)
         df_agg = aggregate_by_product_market_model(df_src, colmap)
 
+        # Diagnóstico opcional (ajuda a validar mapeamento e totais)
+        with st.expander("🔎 Diagnóstico de mapeamento e totais lidos", expanded=False):
+            mapped = {f"{y}-{m:02d}": (colmap[(y,m)] if colmap[(y,m)] is not None else "(não encontrado)") for (y,m) in months}
+            st.write("**Mapeamento de colunas (ano-mês → coluna):**")
+            st.json(mapped, expanded=False)
+            totais = []
+            for (y,m) in months:
+                col = (y,m)
+                if col not in df_agg.columns:
+                    df_agg[col] = 0
+                total_mes = int(pd.to_numeric(df_agg[col], errors="coerce").fillna(0).sum())
+                totais.append({"ano": y, "mes": m, "total_lido": total_mes})
+            df_tot = pd.DataFrame(totais)
+            df_tot["mes_ano"] = df_tot.apply(lambda r: f"{PT_BR_MONTHS[r['mes']].capitalize()}/{r['ano']}", axis=1)
+            st.write("**Necessário por mês (somado do Excel):**")
+            st.dataframe(df_tot[["mes_ano","total_lido"]], use_container_width=True)
+            st.write("**Soma total lida:**", int(df_tot["total_lido"].sum()))
+            st.write("**Feriados considerados:**", ", ".join(sorted([d.isoformat() for d in feriados_set])) or "(nenhum)")
+
         lmt = limite_diario_por_modelo if limite_diario_por_modelo > 0 else None
-        rows, relatorios = build_schedule(df_agg, months, lmt, teto_sabado)
+        rows, relatorios = build_schedule(df_agg, months, lmt, teto_sabado, capacidade_dia_util, feriados_set)
         prog_out, rel_out = finalize_output(rows, relatorios)
 
         por_mercado = prog_out.groupby("mercado").size().reset_index(name="programado")
