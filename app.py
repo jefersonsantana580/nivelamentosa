@@ -17,7 +17,7 @@ import streamlit as st
 # Config e UI
 # =========================
 st.set_page_config(page_title="Programação 2S2026", page_icon="🏭", layout="wide")
-st.title("🏭 Programação de Produção – 2º semestre/2026")
+st.title("🏭 Programação de Produção – 2026")
 
 with st.expander("📎 Instruções (resumo)", expanded=False):
     st.markdown("""
@@ -38,8 +38,8 @@ Pode haver linhas repetidas (PRODUTO/MERCADO/MODELO): serão **somadas**.
 - IDs globais únicos: `fila 1 ... fila N` (ordenados por data, MODELO, PRODUTO).
 
 **Saídas**:
-- Aba **Programacao_2S2026**
-- Aba **Relatorio_2S2026** (programado por **mês de referência** – o mês da demanda, mesmo que a produção inicie dias úteis antes em outro mês)
+- Aba **Programacao_2026**
+- Aba **Relatorio_2026** (programado por **mês de referência** – o mês da demanda, mesmo que a produção inicie dias úteis antes em outro mês)
 - Aba **Base_Original**
     """)
 
@@ -56,7 +56,7 @@ capacidade_dia_util = st.sidebar.number_input(
     help="Capacidade total por dia útil (padrão 50)."
 )
 dias_uteis_anteriores = st.sidebar.number_input(
-    "dias_uteis_anteriores (offset de produção)", min_value=0, step=1, value=0,
+    "dias_uteis_anterior ", min_value=0, step=1, value=0,
     help="Quantidade de dias úteis ANTERIORES ao 1º dia útil do mês de referência. Ex.: Canoas=4, Mogi=6."
 )
 teto_sabado = st.sidebar.number_input(
